@@ -584,7 +584,14 @@ int wmain(int argc, wchar_t **argv)
     const bool pageExists = (GetFileAttributesW(pagePathWide.c_str()) != INVALID_FILE_ATTRIBUTES);
 
     std::wstring pageUrl;
-    if (!pageExists)
+    if (g_opt.navMode == "about")
+    {
+        // 最快的一条基线：不碰文件系统、不碰页面脚本。
+        // 如果连 about:blank 都等不到 NavigationCompleted，问题就在事件管道或
+        // 渲染进程本身，与我们的页面无关。
+        pageUrl = L"about:blank";
+    }
+    else if (!pageExists)
     {
         pageUrl = L"about:blank";
         g_report.error = "page file not found: " + WideToUtf8(pagePathWide);
@@ -921,6 +928,23 @@ int wmain(int argc, wchar_t **argv)
 
     g_report.msTotalToExit = SinceStartMs();
 
+    // 记录本进程树里的 Chromium 子孙 PID。
+    // 这是在为唯一可靠的孤儿归因做准备：宿主死后无法再遍历进程树，而全局 PID 差分
+    // 会把机器上其它 WebView2 应用持续拉起的进程误算成本探针的（实测已发生过）。
+    std::string descendantPidsJson = "[";
+    {
+        const std::vector<DWORD> descendants = CollectDescendants(GetCurrentProcessId());
+        for (size_t i = 0; i < descendants.size(); ++i)
+        {
+            if (i != 0)
+            {
+                descendantPidsJson += ", ";
+            }
+            descendantPidsJson += std::to_string(descendants[i]);
+        }
+    }
+    descendantPidsJson += "]";
+
     // ---- 输出报告（无论后续如何退出，报告都已落盘）----
     const std::string json =
         "{\n"
@@ -973,7 +997,8 @@ int wmain(int argc, wchar_t **argv)
         std::to_string(g_report.memAtExit.childrenWorkingSet / (1024 * 1024)) + ",\n"
         "  \"children_count_at_exit\": " +
         std::to_string(g_report.memAtExit.childProcessCount) + ",\n"
-        "  \"host_pid\": " + std::to_string(GetCurrentProcessId()) + "\n"
+        "  \"host_pid\": " + std::to_string(GetCurrentProcessId()) + ",\n"
+        "  \"descendant_pids\": " + descendantPidsJson + "\n"
         "}\n";
 
     std::fputs(json.c_str(), stdout);
