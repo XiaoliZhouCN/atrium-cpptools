@@ -2,17 +2,20 @@
 #
 # ASCII-only on purpose (see prepare-sdk.ps1 for why).
 #
-# The full suite (run-probe.ps1) takes minutes and needs navigation to work before
-# its numbers mean anything. This script takes about a minute and answers the one
-# question that everything else depends on, by trying three navigation paths in
-# increasing order of dependency:
+# Four combinations, in increasing order of what they depend on. The FIRST one that
+# fails localises the break:
 #
-#   about   -> about:blank. No filesystem, no page JS. Tests only the event plumbing.
-#   string  -> NavigateToString with the real page HTML. Adds the real renderer,
-#              still no filesystem / network serve.
-#   url     -> the real file:/// URI with the query string. Adds the filesystem path.
+#   1 about        about:blank. No filesystem, no page JS, no subresources.
+#   2 string/plain NavigateToString with a page that has ZERO external subresources.
+#                  Adds the real renderer only.
+#   3 string/probe Same, but the page has one <script src="mermaid.min.js"> that
+#                  resolves to a file:// URL (via the injected <base>).
+#                  The ONLY difference from step 2 is that subresource.
+#   4 url/plain    The real file:/// document request, page has no subresources.
+#                  The ONLY difference from step 2 is how the document is fetched.
 #
-# Whichever level first fails tells you where the break is.
+# Step 2 vs 3 isolates "a file:// SUBRESOURCE hangs".
+# Step 2 vs 4 isolates "the file:// DOCUMENT request hangs".
 #
 # Orphan attribution uses the descendant PIDs the probe recorded for ITSELF, not a
 # global PID diff. A global diff is wrong on any machine running other WebView2
@@ -22,10 +25,8 @@
 param(
     [string]$Exe = "",
     [string]$Config = "Release",
-    [int]$AboutTimeoutMs = 10000,
-    [int]$StringTimeoutMs = 20000,
-    [int]$UrlTimeoutMs = 20000,
-    [int]$SettleMs = 4000,
+    [int]$TimeoutMs = 15000,
+    [int]$SettleMs = 3000,
     [switch]$NoShow
 )
 
@@ -45,13 +46,13 @@ $Exe = (Resolve-Path $Exe).Path
 
 $outDir = Join-Path $PSScriptRoot "out\diag"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-$pagePath = Join-Path $PSScriptRoot "page\probe.html"
 
 Write-Host "[diag] executable: $Exe"
-Write-Host "[diag] three navigation paths, about a minute total"
+Write-Host "[diag] four navigation paths, about two minutes total"
 Write-Host ""
 
 $rows = New-Object System.Collections.ArrayList
+$script:lastDescendants = @()
 
 function Stop-Pids {
     param([int[]]$Pids)
@@ -71,31 +72,31 @@ function Test-PidsAlive {
 
 function Invoke-Mode {
     param(
-        [string]$Mode,
+        [string]$Id,
         [string]$Label,
-        [int]$TimeoutMs,
-        [string[]]$ExtraArgs
+        [string]$Mode,
+        [string]$Page,
+        [int]$RunTimeoutMs
     )
 
-    Write-Host "=== $Label ($Mode) ==="
-    $reportPath = Join-Path $outDir "$Mode.json"
+    Write-Host "=== $Id : $Label ==="
+    $reportPath = Join-Path $outDir "$Id.json"
     Remove-Item $reportPath -Force -ErrorAction SilentlyContinue
-    $profileDir = Join-Path $outDir "profile-$Mode"
+    $profileDir = Join-Path $outDir "profile-$Id"
     Remove-Item $profileDir -Recurse -Force -ErrorAction SilentlyContinue
 
-    $args = @()
-    $args += $ExtraArgs
+    $args = @("--mode", "clean")
     $args += @("--nav-mode", $Mode)
     $args += @("--report", $reportPath)
-    $args += @("--page", $pagePath)
+    $args += @("--page", (Join-Path $PSScriptRoot "page\$Page"))
     $args += @("--page-query", "blocks=200&diagrams=0")
     $args += @("--user-data-dir", $profileDir)
     $args += @("--fresh-profile")
-    $args += @("--timeout-ms", "$TimeoutMs")
+    $args += @("--timeout-ms", "$RunTimeoutMs")
     if (-not $NoShow) { $args += "--show" }
 
     $proc = Start-Process -FilePath $Exe -ArgumentList $args -PassThru -WindowStyle Hidden
-    $deadline = (Get-Date).AddMilliseconds($TimeoutMs + 25000)
+    $deadline = (Get-Date).AddMilliseconds($RunTimeoutMs + 25000)
     while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 200
     }
@@ -104,20 +105,17 @@ function Invoke-Mode {
         Write-Host "  host had to be killed"
     }
 
-    $row = [ordered]@{ mode = $Mode; nav_ok = $false }
+    $row = [ordered]@{ id = $Id; mode = $Mode; page = $Page; nav_ok = $false }
 
     if (Test-Path $reportPath) {
         try {
             $r = Get-Content $reportPath -Raw | ConvertFrom-Json
-            $row.env_ms  = [int]$r.ms_environment_created
-            $row.ctrl_ms = [int]$r.ms_controller_created
-            $row.nav_ms  = [int]$r.ms_navigation_completed
             $row.nav_ok  = ([int]$r.ms_navigation_completed -gt 0) -and (-not $r.navigation_failed)
+            $row.nav_ms  = [int]$r.ms_navigation_completed
             $row.seen    = [bool]$r.nav_starting_seen
-            $row.title   = $r.document_title
             if ($r.error) { $row.error = $r.error }
-            if ($r.nav_error_status -ne 0) { $row.nav_err = $r.nav_error_status }
             if ($r.process_failed_kind) { $row.proc_failed = $r.process_failed_kind }
+            if ($r.diag_script_result) { $row.page_state = $r.diag_script_result }
             $script:lastDescendants = @($r.descendant_pids)
         } catch {
             $row.error = "report parse failed: $($_.Exception.Message)"
@@ -128,57 +126,65 @@ function Invoke-Mode {
         $script:lastDescendants = @()
     }
 
-    # Precise orphan check: only the PIDs this probe recorded as its own descendants.
     Start-Sleep -Milliseconds $SettleMs
     $desc = @($script:lastDescendants)
     $alive = @(Test-PidsAlive -Pids $desc)
     $row.descendants = $desc.Count
     $row.orphans = $alive.Count
-    $row.orphan_pids = ($alive -join ',')
 
     Stop-Pids -Pids $desc
     Start-Sleep -Milliseconds 1500
-    $stillAlive = @(Test-PidsAlive -Pids $desc)
-    $row.orphans_after_kill = $stillAlive.Count
+    $row.orphans_after_kill = @(Test-PidsAlive -Pids $desc).Count
 
     [void]$rows.Add([pscustomobject]$row)
-    Write-Host "  nav_ok=$($row.nav_ok)  ctrl_ms=$($row.ctrl_ms)  nav_ms=$($row.nav_ms)  seen=$($row.seen)  descendants=$($row.descendants)  orphans=$($row.orphans)"
-    if ($row.error) { Write-Host "  error: $($row.error)" }
+    Write-Host "  nav_ok=$($row.nav_ok)  nav_ms=$($row.nav_ms)  seen=$($row.seen)  descendants=$($row.descendants)  orphans=$($row.orphans)"
+    if ($row.error)      { Write-Host "  error     : $($row.error)" }
+    if ($row.page_state) { Write-Host "  page_state: $($row.page_state)" }
+    if ($row.proc_failed){ Write-Host "  procFailed: $($row.proc_failed)" }
     Write-Host ""
 }
 
-# Run the three levels. Options are identical except for the navigation mode, so a
-# difference in outcome can only come from the navigation path itself.
-Invoke-Mode -Mode "about"  -Label "1/3 about:blank (event plumbing only)" -TimeoutMs $AboutTimeoutMs  -ExtraArgs @("--mode", "clean")
-Invoke-Mode -Mode "string" -Label "2/3 NavigateToString (adds the renderer)" -TimeoutMs $StringTimeoutMs -ExtraArgs @("--mode", "clean")
-Invoke-Mode -Mode "url"    -Label "3/3 file:// URI (adds the filesystem path)" -TimeoutMs $UrlTimeoutMs -ExtraArgs @("--mode", "clean")
+Invoke-Mode -Id "1-about"        -Label "about:blank (plumbing only)"                -Mode "about"  -Page "plain.html" -RunTimeoutMs $TimeoutMs
+Invoke-Mode -Id "2-str-plain"    -Label "NavigateToString + page with NO subresources" -Mode "string" -Page "plain.html" -RunTimeoutMs $TimeoutMs
+Invoke-Mode -Id "3-str-probe"    -Label "NavigateToString + page WITH a file:// script" -Mode "string" -Page "probe.html" -RunTimeoutMs $TimeoutMs
+Invoke-Mode -Id "4-url-plain"    -Label "file:// document + page with no subresources" -Mode "url"    -Page "plain.html" -RunTimeoutMs $TimeoutMs
 
 Write-Host "================ DIAGNOSIS ================"
-$rows | Format-Table -AutoSize
+$rows | Select-Object id, mode, page, nav_ok, nav_ms, seen, descendants, orphans | Format-Table -AutoSize
 
-$about  = $rows | Where-Object { $_.mode -eq "about" }
-$string = $rows | Where-Object { $_.mode -eq "string" }
-$url    = $rows | Where-Object { $_.mode -eq "url" }
+$r1 = $rows | Where-Object { $_.id -eq "1-about" }
+$r2 = $rows | Where-Object { $_.id -eq "2-str-plain" }
+$r3 = $rows | Where-Object { $_.id -eq "3-str-probe" }
+$r4 = $rows | Where-Object { $_.id -eq "4-url-plain" }
 
 Write-Host ""
-if (-not $about.nav_ok) {
-    Write-Host "VERDICT: even about:blank never completes." -ForegroundColor Red
-    Write-Host "  The renderer/event pipeline itself is not working here, independent of our page."
-    Write-Host "  Check 'error', 'proc_failed' and the WebView2 Runtime installation."
-} elseif (-not $string.nav_ok) {
-    Write-Host "VERDICT: about:blank works, NavigateToString does not." -ForegroundColor Yellow
-    Write-Host "  Event plumbing is fine; rendering real HTML is not. Look at 'proc_failed' / 'nav_err'."
-} elseif (-not $url.nav_ok) {
-    Write-Host "VERDICT: about:blank and NavigateToString work; the file:// URI does not." -ForegroundColor Yellow
-    Write-Host "  The break is in serving the page from disk. Workarounds: read the file in C++"
-    Write-Host "  and use NavigateToString (plus a <base> for relative resources), or serve over a"
-    Write-Host "  local custom scheme / loopback. This is a real architecture input."
+if (-not $r1.nav_ok) {
+    Write-Host "VERDICT A: even about:blank never completes." -ForegroundColor Red
+    Write-Host "  The event pipeline itself is broken here; nothing else can be trusted."
+} elseif (-not $r2.nav_ok) {
+    Write-Host "VERDICT B: about:blank works, but rendering a plain inline page does not." -ForegroundColor Red
+    Write-Host "  The renderer cannot commit real content. No file:// involved at all."
+    Write-Host "  This is a hard blocker for the WebView2 architecture on this machine."
+    Write-Host "  Worth checking: antivirus/EDR interfering with Chromium child processes,"
+    Write-Host "  and whether other WebView2 apps on this machine actually render (they do"
+    Write-Host "  spawn processes, but spawning is not rendering)."
+} elseif (-not $r3.nav_ok) {
+    Write-Host "VERDICT C: a file:// SUBRESOURCE hangs the page load." -ForegroundColor Yellow
+    Write-Host "  Inline rendering works; adding one <script src> that resolves to file:// breaks it."
+    Write-Host "  FIX: do not load subresources over file://. Read the assets in C++ and inject them,"
+    Write-Host "  or map the asset folder with SetVirtualHostNameToFolderMapping and load over https."
+} elseif (-not $r4.nav_ok) {
+    Write-Host "VERDICT D: the file:// DOCUMENT request hangs (subresources are fine)." -ForegroundColor Yellow
+    Write-Host "  FIX: never navigate to file://. Use SetVirtualHostNameToFolderMapping to serve the"
+    Write-Host "  app folder over a virtual https host, or read the page in C++ and NavigateToString."
 } else {
-    Write-Host "VERDICT: all three paths work. Re-run the full suite: .\run-probe.ps1" -ForegroundColor Green
+    Write-Host "VERDICT E: all four paths work." -ForegroundColor Green
+    Write-Host "  Whatever breaks the full suite is specific to probe.html content or its query string."
+    Write-Host "  Compare page_state between runs and re-run the full suite."
 }
 
 Write-Host ""
 Write-Host "JSON reports: $outDir"
 $leftover = 0
-foreach ($r in $rows) { $leftover += [int]$r.orphans_after_kill }
+foreach ($row in $rows) { $leftover += [int]$row.orphans_after_kill }
 Write-Host "Probe-recorded descendant processes still alive after cleanup: $leftover"

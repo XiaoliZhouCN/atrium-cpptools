@@ -273,12 +273,19 @@ struct Report
     long long hresultNavigate = 0;
     long long hresultNavigateToString = 0;
     bool webviewIsNull = false;
+
+    // 导航超时后主动问页面"你走到哪一步了"。这是区分
+    // "文档已加载但 load 事件没触发（子资源挂住）" 与
+    // "渲染进程根本没处理文档" 的唯一手段。
+    std::string diagScriptResult;
+    long long diagScriptHresult = 0;
 };
 
 Report g_report;
 
 bool g_navigationDone = false;
 bool g_fatal = false;
+bool g_diagScriptDone = false;
 
 std::string WideToUtf8(const std::wstring &wide)
 {
@@ -889,6 +896,47 @@ int wmain(int argc, wchar_t **argv)
     {
         PumpMessages(20);
     }
+    // 导航没回来时，主动问页面一句"你走到哪一步了"。
+    //   readyState=loading 且 bodyLen>0  -> 文档已解析，但在等某个子资源
+    //   ExecuteScript 完全不返回          -> 渲染进程没有处理文档
+    if ((!g_navigationDone || g_report.msNavigationCompleted <= 0.0) && webview != nullptr)
+    {
+        g_diagScriptDone = false;
+        const HRESULT scriptHr = webview->ExecuteScript(
+            L"(function(){try{return 'readyState=' + document.readyState +"
+            L" '|href=' + location.href +"
+            L" '|bodyLen=' + (document.body ? document.body.innerHTML.length : -1) +"
+            L" '|scripts=' + document.scripts.length +"
+            L" '|links=' + document.querySelectorAll('link').length +"
+            L" '|imgs=' + document.images.length;}catch(e){return 'JSERR:' + e;}})()",
+            Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+                [](HRESULT resultHr, LPCWSTR result) -> HRESULT {
+                    g_report.diagScriptHresult = resultHr;
+                    if (result != nullptr)
+                    {
+                        g_report.diagScriptResult = WideToUtf8(result);
+                    }
+                    g_diagScriptDone = true;
+                    return S_OK;
+                })
+                .Get());
+        if (FAILED(scriptHr))
+        {
+            g_report.diagScriptHresult = scriptHr;
+            g_report.diagScriptResult = "(ExecuteScript dispatch failed)";
+            g_diagScriptDone = true;
+        }
+        const DWORD scriptDeadline = GetTickCount() + 5000;
+        while (!g_diagScriptDone && GetTickCount() < scriptDeadline)
+        {
+            PumpMessages(20);
+        }
+        if (!g_diagScriptDone)
+        {
+            g_report.diagScriptResult = "(ExecuteScript never returned)";
+        }
+    }
+
     if (!g_navigationDone)
     {
         // 区分"卡在 controller"与"卡在导航"。只说 "timeout waiting for
@@ -970,6 +1018,8 @@ int wmain(int argc, wchar_t **argv)
         "  \"webview_is_null\": " + (g_report.webviewIsNull ? "true" : "false") + ",\n"
         "  \"hresult_navigate\": " + std::to_string(g_report.hresultNavigate) + ",\n"
         "  \"hresult_navigate_to_string\": " + std::to_string(g_report.hresultNavigateToString) + ",\n"
+        "  \"diag_script_result\": \"" + JsonEscape(g_report.diagScriptResult) + "\",\n"
+        "  \"diag_script_hresult\": " + std::to_string(g_report.diagScriptHresult) + ",\n"
         "  \"job_requested\": " + (g_report.jobRequested ? "true" : "false") + ",\n"
         "  \"job_created\": " + (g_report.jobCreated ? "true" : "false") + ",\n"
         "  \"job_assigned_processes\": " + std::to_string(g_report.jobAssigned) + ",\n"
