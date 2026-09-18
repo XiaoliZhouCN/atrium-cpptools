@@ -1,0 +1,52 @@
+# 构建产物
+build/
+out/
+[Bb]uild*/
+!build.bat
+
+# CMake 生成物
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+*.cmake.stamp
+compile_commands.json
+.ninja_deps
+.ninja_log
+*.ninja
+
+# 编译器 / 链接器产物
+*.obj
+*.o
+*.lo
+*.a
+*.lib
+*.exp
+*.dll
+*.pdb
+*.ilk
+*.exe
+!build.bat
+
+# IDE（工程文件由 CMake 生成，不进版本库）
+.vs/
+.vscode/
+.idea/
+*.vcxproj
+*.vcxproj.*
+*.sln
+*.xcodeproj/
+*.code-workspace
+
+# 工具缓存与临时产物
+.cache/
+ccache/
+.tmp/
+*.log
+*.trace
+
+# 运行时状态与本地配置（§5.9：状态数据只允许写入 Storage/cache/<tool_id>/）
+*.local.json
+local/
+Data/

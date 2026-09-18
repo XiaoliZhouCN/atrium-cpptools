@@ -1,0 +1,38 @@
+# 统一换行：仓库内存 LF，检出时 Windows 侧转 CRLF 由各工具自行处理
+* text=auto eol=lf
+
+# 明确按文本处理
+*.md        text eol=lf
+*.txt       text eol=lf
+*.json      text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.toml      text eol=lf
+*.cmake     text eol=lf
+CMakeLists.txt text eol=lf
+*.cpp       text eol=lf
+*.hpp       text eol=lf
+*.h         text eol=lf
+*.c         text eol=lf
+*.sksl      text eol=lf
+*.hlsl      text eol=lf
+*.hlsli     text eol=lf
+*.bat       text eol=crlf
+*.ps1       text eol=crlf
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+
+# 二进制：禁止换行转换与 diff
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.webp      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.mp4       binary
+*.zip       binary
+*.7z        binary
+
+# 便于复核的 diff 驱动（可选）
+*.md        diff=markdown
