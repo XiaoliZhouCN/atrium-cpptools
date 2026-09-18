@@ -1,7 +1,0 @@
-# --- probe build / run artifacts ---
-build/
-out/
-.sdk/
-
-# WebView2 user-data folder created next to the executable
-.wv2profile/
