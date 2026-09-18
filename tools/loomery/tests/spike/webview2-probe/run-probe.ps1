@@ -10,6 +10,13 @@
 # Orphan detection is a PID diff against a baseline snapshot, because this machine
 # already has unrelated msedgewebview2.exe processes running -- a plain process
 # count would be meaningless.
+#
+# Two hard-won details:
+#   * Every scenario gets its OWN user-data directory. Sharing one profile makes
+#     the previous scenario's still-running Chromium children hold it, which shows
+#     up as flaky controller-creation failures and hangs.
+#   * Never use Start-Process -Wait: it waits for the whole process TREE, and the
+#     Chromium children are exactly what may outlive the host.
 
 [CmdletBinding()]
 param(
@@ -20,7 +27,8 @@ param(
     [int]$DiagramCount = 3,
     [int]$ProbeTimeoutMs = 30000,
     [switch]$NoShow,
-    [switch]$SkipJobObjectScenarios
+    [switch]$SkipJobObjectScenarios,
+    [switch]$UseNavigateToString
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,7 +50,6 @@ if (-not $Exe -or -not (Test-Path $Exe)) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Write-Host "[probe] executable: $Exe"
-Write-Host "[probe] host msedgewebview2.exe runtime is shared with Edge; version follows the installed runtime."
 
 $outDir = Join-Path $PSScriptRoot "out"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -53,27 +60,64 @@ function Get-ChromiumPids {
 }
 
 $script:baseline = Get-ChromiumPids
-Write-Host "[probe] baseline msedgewebview2.exe processes: $($script:baseline.Count)"
+Write-Host "[probe] baseline msedgewebview2.exe processes (yours, left alone): $($script:baseline.Count)"
 Write-Host ""
 
 $results = New-Object System.Collections.ArrayList
 
+# Remove Chromium processes this probe created in an EARLIER scenario, and wait for
+# them to actually disappear. Without this the next scenario inherits a held profile
+# directory and a half-dead process tree, which makes the whole run flaky.
+function Clear-ProbeChromium {
+    param([string]$Context)
+
+    $leftovers = @(Get-ChromiumPids | Where-Object { $script:baseline -notcontains $_ })
+    if ($leftovers.Count -eq 0) { return }
+
+    Write-Host "  ($Context`: clearing $($leftovers.Count) leftover Chromium process(es) from a previous scenario)"
+    foreach ($procId in $leftovers) {
+        try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch { }
+    }
+
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        $still = @(Get-ChromiumPids | Where-Object { $script:baseline -notcontains $_ })
+        if ($still.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 300
+    }
+
+    $remaining = @(Get-ChromiumPids | Where-Object { $script:baseline -notcontains $_ })
+    if ($remaining.Count -gt 0) {
+        Write-Host "  ($Context`: $($remaining.Count) process(es) would not die; results may be affected)"
+    }
+}
+
 function Invoke-Scenario {
     param(
         [string]$Name,
+        [string]$ProfileName,
         [string[]]$ExtraArgs,
-        [switch]$ExternalKill
+        [switch]$ExternalKill,
+        [switch]$ReuseProfile
     )
 
     Write-Host "=== $Name ==="
+    Clear-ProbeChromium -Context $Name
+
     $reportPath = Join-Path $outDir "$Name.json"
     Remove-Item $reportPath -Force -ErrorAction SilentlyContinue
+
+    $profileDir = Join-Path $outDir "profile-$ProfileName"
 
     $args = @()
     $args += $ExtraArgs
     $args += @("--report", $reportPath)
-    $args += @("--page", (Join-Path $PSScriptRoot "page\probe.html") + "?blocks=2000&diagrams=$DiagramCount")
+    $args += @("--page", (Join-Path $PSScriptRoot "page\probe.html"))
+    $args += @("--page-query", "blocks=2000&diagrams=$DiagramCount")
+    $args += @("--user-data-dir", $profileDir)
     $args += @("--timeout-ms", "$ProbeTimeoutMs")
+    if (-not $ReuseProfile) { $args += "--fresh-profile" }
+    if ($UseNavigateToString) { $args += @("--nav-mode", "string") }
     # A hidden WebView2 may skip rendering, which would UNDERSTATE the memory figure.
     # Default to a visible window so the numbers reflect a real session.
     if (-not $NoShow) { $args += "--show" }
@@ -148,6 +192,12 @@ function Invoke-Scenario {
             $row.total_mb    = [int]$r.self_ws_mb_at_navigation + [int]$r.children_ws_mb_at_navigation
             $row.child_procs = [int]$r.children_count_at_navigation
             if ($r.error) { $row.error = $r.error }
+            if ($r.process_failed_kind) { $row.proc_failed = $r.process_failed_kind }
+            if ($r.resolved_page_url) { $row.url = $r.resolved_page_url }
+            if ($r.nav_error_status -ne 0) { $row.nav_err = $r.nav_error_status }
+            if ($r.hresult_get_webview -ne 0) { $row.wv_hr = $r.hresult_get_webview }
+            if ($r.hresult_navigate -ne 0) { $row.nav_hr = $r.hresult_navigate }
+            if ($r.nav_starting_seen) { $row.nav_started = $true }
         } catch {
             $row.error = "report parse failed: $($_.Exception.Message)"
         }
@@ -167,14 +217,16 @@ function Invoke-Scenario {
 }
 
 # --- scenarios -----------------------------------------------------------------
-Invoke-Scenario -Name "clean-cold"         -ExtraArgs @("--mode", "clean", "--fresh-profile")
-Invoke-Scenario -Name "clean-warm"         -ExtraArgs @("--mode", "clean")
-Invoke-Scenario -Name "hard-selfkill"      -ExtraArgs @("--mode", "hard")
-Invoke-Scenario -Name "kill-external"      -ExtraArgs @("--mode", "clean", "--hold-ms", "60000") -ExternalKill
+# clean-cold / clean-warm deliberately SHARE a profile: that pair is what measures
+# cold vs warm. Every other scenario gets its own, to stay independent.
+Invoke-Scenario -Name "clean-cold"        -ProfileName "main" -ExtraArgs @("--mode", "clean")
+Invoke-Scenario -Name "clean-warm"        -ProfileName "main" -ExtraArgs @("--mode", "clean") -ReuseProfile
+Invoke-Scenario -Name "hard-selfkill"     -ProfileName "hard" -ExtraArgs @("--mode", "hard")
+Invoke-Scenario -Name "kill-external"     -ProfileName "kill" -ExtraArgs @("--mode", "clean", "--hold-ms", "60000") -ExternalKill
 
 if (-not $SkipJobObjectScenarios) {
-    Invoke-Scenario -Name "clean-jobobject"    -ExtraArgs @("--mode", "clean", "--fresh-profile", "--job-object")
-    Invoke-Scenario -Name "kill-external-job"  -ExtraArgs @("--mode", "clean", "--job-object", "--hold-ms", "60000") -ExternalKill
+    Invoke-Scenario -Name "clean-jobobject"   -ProfileName "jobclean" -ExtraArgs @("--mode", "clean", "--job-object")
+    Invoke-Scenario -Name "kill-external-job" -ProfileName "jobkill" -ExtraArgs @("--mode", "clean", "--job-object", "--hold-ms", "60000") -ExternalKill
 }
 
 # --- report --------------------------------------------------------------------
@@ -185,10 +237,18 @@ $results | Format-Table -AutoSize
 $invalid = @($results | Where-Object { -not $_.valid })
 if ($invalid.Count -gt 0) {
     Write-Host "NOTE: $($invalid.Count) scenario(s) never reached NavigationCompleted, so they are" -ForegroundColor Yellow
-    Write-Host "      EXCLUDED from the orphan verdict below (their numbers are not meaningful):" -ForegroundColor Yellow
+    Write-Host "      EXCLUDED from the orphan verdict below (their numbers are not meaningful)." -ForegroundColor Yellow
+    Write-Host "      Diagnostics per scenario:" -ForegroundColor Yellow
     foreach ($r in $invalid) {
         $why = if ($null -ne $r.error -and $r.error) { $r.error } else { "no report / killed before navigation" }
-        Write-Host "        - $($r.scenario): $why"
+        Write-Host "        - $($r.scenario)"
+        Write-Host "            error : $why"
+        if ($null -ne $r.url)         { Write-Host "            url   : $($r.url)" }
+        if ($null -ne $r.nav_err)     { Write-Host "            navErr: $($r.nav_err)" }
+        if ($null -ne $r.proc_failed) { Write-Host "            procFailed: kind=$($r.proc_failed)" }
+        if ($null -ne $r.wv_hr)       { Write-Host "            get_CoreWebView2 hr: $($r.wv_hr)" }
+        if ($null -ne $r.nav_hr)      { Write-Host "            Navigate hr: $($r.nav_hr)" }
+        Write-Host "            NavigationStarting seen: $([bool]$r.nav_started)"
     }
     Write-Host ""
 }
@@ -198,8 +258,7 @@ $orphanRisk = @($validResults | Where-Object { $_.orphans_after3s -gt 0 })
 
 if ($validResults.Count -eq 0) {
     Write-Host "INCONCLUSIVE: no scenario reached NavigationCompleted." -ForegroundColor Yellow
-    Write-Host "  Check the 'error' column in out/*.json, and make sure the WebView2 Runtime is" -ForegroundColor Yellow
-    Write-Host "  usable in this session (Edge/WebView2 must be able to start)." -ForegroundColor Yellow
+    Write-Host "  Check the per-scenario diagnostics above and out/*.json." -ForegroundColor Yellow
 } elseif ($orphanRisk.Count -eq 0) {
     Write-Host "ORPHANS: none in any valid scenario. No Job Object mitigation appears necessary." -ForegroundColor Green
 } else {
@@ -223,9 +282,22 @@ if ($leftovers.Count -gt 0) {
     foreach ($procId in $leftovers) {
         try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch { }
     }
-    Start-Sleep -Seconds 2
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {
+        $final = @(Get-ChromiumPids | Where-Object { $script:baseline -notcontains $_ })
+        if ($final.Count -eq 0) { break }
+        foreach ($procId in $final) {
+            try { Stop-Process -Id $procId -Force -ErrorAction Stop } catch { }
+        }
+        Start-Sleep -Milliseconds 500
+    }
     $final = @(Get-ChromiumPids | Where-Object { $script:baseline -notcontains $_ })
-    Write-Host "Remaining probe-generated processes after cleanup: $($final.Count)"
+    if ($final.Count -eq 0) {
+        Write-Host "All probe-generated processes are gone."
+    } else {
+        Write-Host "Still alive after cleanup: $($final.Count) (PIDs: $($final -join ', '))" -ForegroundColor Yellow
+        Write-Host "These are Chromium children that outlived their host -- note them down." -ForegroundColor Yellow
+    }
 } else {
     Write-Host "Nothing to clean up."
 }

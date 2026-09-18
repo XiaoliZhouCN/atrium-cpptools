@@ -59,6 +59,8 @@ struct Options
     std::string reportPath;
     std::string userDataDir;
     std::string pagePath;
+    std::string pageQuery;              // 与路径分开，避免把 "?a=b" 当成文件名
+    std::string navMode = "url";        // url | string
     bool freshProfile = false;
     bool jobObject = false;
     bool show = false;
@@ -250,6 +252,27 @@ struct Report
     std::string mode;
     std::string userDataDir;
     long long childPidObserved = 0;
+
+    // 诊断字段：导航没回来时，靠这些定位原因。
+    std::string navMode;
+    std::string resolvedPageUrl;   // 实际交给 Navigate 的 URI
+    std::string navStartingUrl;    // NavigationStarting 报告的 URI
+    std::string sourceChangedUrl;  // SourceChanged 报告的 URI
+    std::string documentTitle;
+    int navErrorStatus = 0;        // COREWEBVIEW2_WEB_ERROR_STATUS
+    bool navStartingSeen = false;
+    bool sourceChangedSeen = false;
+    std::string processFailedKind; // ProcessFailed：渲染进程崩溃/被杀
+    std::string processFailedReason;
+    std::string processFailedDescription;
+    int processFailedExitCode = 0;
+
+    // 导航链路上每一跳的 HRESULT。NavigationCompleted 不来时，靠这些区分
+    // "根本没发起导航" 与 "发起了但浏览器没回"。
+    long long hresultGetWebView = 0;
+    long long hresultNavigate = 0;
+    long long hresultNavigateToString = 0;
+    bool webviewIsNull = false;
 };
 
 Report g_report;
@@ -322,6 +345,70 @@ std::wstring ExecutableDirectory()
     std::wstring path(buffer, length);
     const size_t slash = path.find_last_of(L"\\/");
     return slash == std::wstring::npos ? path : path.substr(0, slash);
+}
+
+// 把 Windows 路径转成 file:/// URI。
+// 必须做这一步：ICoreWebView2::Navigate 接受的是 URI，不是文件系统路径。
+// 直接传 "D:\dir\page.html" 会得到一个无效 URI，NavigationCompleted 永远不来。
+std::wstring BuildFileUrl(const std::wstring &path, const std::wstring &query)
+{
+    std::wstring normalized = path;
+    for (wchar_t &c : normalized)
+    {
+        if (c == L'\\')
+        {
+            c = L'/';
+        }
+    }
+    std::wstring url = L"file:///";
+    if (!normalized.empty() && normalized.front() == L'/')
+    {
+        normalized.erase(normalized.begin());
+    }
+    url += normalized;
+    if (!query.empty())
+    {
+        url += L'?';
+        url += query;
+    }
+    return url;
+}
+
+// 目录部分（用于 NavigateToString 时注入 <base>）。
+std::wstring DirectoryUrlOf(const std::wstring &filePath)
+{
+    const size_t slash = filePath.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+    {
+        return L"";
+    }
+    return BuildFileUrl(filePath.substr(0, slash + 1), L"");
+}
+
+bool ReadFileUtf8(const std::wstring &path, std::string &out)
+{
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > (64LL << 20))
+    {
+        CloseHandle(file);
+        return false;
+    }
+    out.assign(static_cast<size_t>(size.QuadPart), '\0');
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, out.data(), static_cast<DWORD>(out.size()), &read, nullptr);
+    CloseHandle(file);
+    if (!ok)
+    {
+        return false;
+    }
+    out.resize(read);
+    return true;
 }
 
 void PumpMessages(int milliseconds)
@@ -402,6 +489,14 @@ int wmain(int argc, wchar_t **argv)
         {
             next(g_opt.pagePath);
         }
+        else if (arg == L"--page-query")
+        {
+            next(g_opt.pageQuery);
+        }
+        else if (arg == L"--nav-mode")
+        {
+            next(g_opt.navMode);
+        }
         else if (arg == L"--hold-ms")
         {
             std::string value;
@@ -475,23 +570,36 @@ int wmain(int argc, wchar_t **argv)
         }
     }
 
-    // 默认页：探针自带的本地页；找不到则用 about:blank。
-    std::wstring pageUrl;
+    // 页面路径与 query 必须分开：带上 "?a=b" 之后 GetFileAttributesW 必然失败，
+    // 会静默退化成 about:blank，页面与 mermaid 都不会被加载。
+    std::wstring pagePathWide;
     if (!g_opt.pagePath.empty())
     {
-        pageUrl = Utf8ToWide(g_opt.pagePath);
+        pagePathWide = Utf8ToWide(g_opt.pagePath);
     }
     else
     {
-        pageUrl = exeDir + L"\\page\\probe.html";
+        pagePathWide = exeDir + L"\\page\\probe.html";
     }
+    const bool pageExists = (GetFileAttributesW(pagePathWide.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+    std::wstring pageUrl;
+    if (!pageExists)
     {
-        const DWORD attributes = GetFileAttributesW(pageUrl.c_str());
-        if (attributes == INVALID_FILE_ATTRIBUTES)
-        {
-            pageUrl = L"about:blank";
-        }
+        pageUrl = L"about:blank";
+        g_report.error = "page file not found: " + WideToUtf8(pagePathWide);
     }
+    else if (g_opt.navMode == "string")
+    {
+        pageUrl = L"(NavigateToString)";
+    }
+    else
+    {
+        // Navigate 要 URI，不是 Windows 路径。
+        pageUrl = BuildFileUrl(pagePathWide, Utf8ToWide(g_opt.pageQuery));
+    }
+    g_report.navMode = g_opt.navMode;
+    g_report.resolvedPageUrl = WideToUtf8(pageUrl);
 
     ComPtr<ICoreWebView2Environment> environment;
     ComPtr<ICoreWebView2Controller> controller;
@@ -543,7 +651,18 @@ int wmain(int argc, wchar_t **argv)
                                     return S_OK;
                                 }
                                 controller = createdController;
-                                controller->get_CoreWebView2(&webview);
+                                const HRESULT webviewHr =
+                                    controller->get_CoreWebView2(&webview);
+                                g_report.hresultGetWebView = webviewHr;
+                                g_report.webviewIsNull = (webview == nullptr);
+                                if (FAILED(webviewHr) || webview == nullptr)
+                                {
+                                    g_report.error =
+                                        "get_CoreWebView2 failed, hr=" +
+                                        std::to_string(webviewHr);
+                                    g_navigationDone = true;
+                                    return S_OK;
+                                }
                                 g_report.msControllerCreated = SinceStartMs();
 
                                 RECT bounds{0, 0, g_opt.show ? 1024 : 1,
@@ -563,21 +682,117 @@ int wmain(int argc, wchar_t **argv)
                                 }
 
                                 EventRegistrationToken token{};
+
+                                // 导航没回来时，以下三个事件是唯一能说明"卡在哪一步"的信息。
+                                webview->add_NavigationStarting(
+                                    Callback<ICoreWebView2NavigationStartingEventHandler>(
+                                        [&](ICoreWebView2 *,
+                                            ICoreWebView2NavigationStartingEventArgs *args)
+                                            -> HRESULT {
+                                            LPWSTR uri = nullptr;
+                                            if (SUCCEEDED(args->get_Uri(&uri)) && uri != nullptr)
+                                            {
+                                                g_report.navStartingUrl = WideToUtf8(uri);
+                                                CoTaskMemFree(uri);
+                                            }
+                                            g_report.navStartingSeen = true;
+                                            return S_OK;
+                                        })
+                                        .Get(),
+                                    &token);
+
+                                webview->add_SourceChanged(
+                                    Callback<ICoreWebView2SourceChangedEventHandler>(
+                                        [&](ICoreWebView2 *sender,
+                                            ICoreWebView2SourceChangedEventArgs *) -> HRESULT {
+                                            LPWSTR source = nullptr;
+                                            if (sender != nullptr &&
+                                                SUCCEEDED(sender->get_Source(&source)) &&
+                                                source != nullptr)
+                                            {
+                                                g_report.sourceChangedUrl = WideToUtf8(source);
+                                                CoTaskMemFree(source);
+                                            }
+                                            g_report.sourceChangedSeen = true;
+                                            return S_OK;
+                                        })
+                                        .Get(),
+                                    &token);
+
+                                webview->add_ProcessFailed(
+                                    Callback<ICoreWebView2ProcessFailedEventHandler>(
+                                        [&](ICoreWebView2 *,
+                                            ICoreWebView2ProcessFailedEventArgs *args)
+                                            -> HRESULT {
+                                            COREWEBVIEW2_PROCESS_FAILED_KIND kind{};
+                                            args->get_ProcessFailedKind(&kind);
+                                            g_report.processFailedKind =
+                                                std::to_string(static_cast<int>(kind));
+
+                                            // get_Reason / get_ExitCode / get_ProcessDescription
+                                            // 都在 ProcessFailedEventArgs2 上，基接口没有。
+                                            ComPtr<ICoreWebView2ProcessFailedEventArgs2> args2;
+                                            if (SUCCEEDED(args->QueryInterface(
+                                                    IID_PPV_ARGS(&args2))) &&
+                                                args2 != nullptr)
+                                            {
+                                                COREWEBVIEW2_PROCESS_FAILED_REASON reason{};
+                                                if (SUCCEEDED(args2->get_Reason(&reason)))
+                                                {
+                                                    g_report.processFailedReason =
+                                                        std::to_string(static_cast<int>(reason));
+                                                }
+                                                int exitCode = 0;
+                                                if (SUCCEEDED(args2->get_ExitCode(&exitCode)))
+                                                {
+                                                    g_report.processFailedExitCode = exitCode;
+                                                }
+                                                LPWSTR description = nullptr;
+                                                if (SUCCEEDED(args2->get_ProcessDescription(
+                                                        &description)) &&
+                                                    description != nullptr)
+                                                {
+                                                    g_report.processFailedDescription =
+                                                        WideToUtf8(description);
+                                                    CoTaskMemFree(description);
+                                                }
+                                            }
+                                            // 进程失败后不会再有任何导航事件，必须主动收尾。
+                                            g_navigationDone = true;
+                                            return S_OK;
+                                        })
+                                        .Get(),
+                                    &token);
+
                                 webview->add_NavigationCompleted(
                                     Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                                        [&](ICoreWebView2 *,
+                                        [&](ICoreWebView2 *sender,
                                             ICoreWebView2NavigationCompletedEventArgs *args)
                                             -> HRESULT {
                                             BOOL success = FALSE;
                                             args->get_IsSuccess(&success);
                                             g_report.navigationFailed = (success == FALSE);
-                                            if (success == FALSE)
+                                            COREWEBVIEW2_WEB_ERROR_STATUS status{};
+                                            if (SUCCEEDED(args->get_WebErrorStatus(&status)))
                                             {
-                                                COREWEBVIEW2_WEB_ERROR_STATUS status{};
-                                                args->get_WebErrorStatus(&status);
+                                                g_report.navErrorStatus =
+                                                    static_cast<int>(status);
+                                            }
+                                            if (sender != nullptr)
+                                            {
+                                                LPWSTR title = nullptr;
+                                                if (SUCCEEDED(sender->get_DocumentTitle(&title)) &&
+                                                    title != nullptr)
+                                                {
+                                                    g_report.documentTitle = WideToUtf8(title);
+                                                    CoTaskMemFree(title);
+                                                }
+                                            }
+                                            if (success == FALSE && g_report.error.empty())
+                                            {
                                                 g_report.error =
-                                                    "navigation failed, status=" +
-                                                    std::to_string(static_cast<int>(status));
+                                                    "navigation failed, WebErrorStatus=" +
+                                                    std::to_string(g_report.navErrorStatus);
                                             }
                                             g_report.msNavigationCompleted = SinceStartMs();
                                             g_report.memAtNavigation = SampleMemory();
@@ -592,7 +807,53 @@ int wmain(int argc, wchar_t **argv)
                                     g_report.jobAssigned += AssignDescendantsToJob();
                                 }
 
-                                webview->Navigate(pageUrl.c_str());
+                                if (g_opt.navMode == "string")
+                                {
+                                    // 诊断分支：绕开 file:// URI 解析。相对资源靠注入的
+                                    // <base> 找回，查询参数走 window.__probeQuery。
+                                    std::string html;
+                                    if (!ReadFileUtf8(pagePathWide, html))
+                                    {
+                                        g_report.error =
+                                            "NavigateToString: could not read page file";
+                                        g_navigationDone = true;
+                                        return S_OK;
+                                    }
+                                    std::string injection =
+                                        "<base href=\"" +
+                                        WideToUtf8(DirectoryUrlOf(pagePathWide)) + "\">";
+                                    if (!g_opt.pageQuery.empty())
+                                    {
+                                        injection +=
+                                            "<script>window.__probeQuery=\"?" +
+                                            g_opt.pageQuery + "\";</script>";
+                                    }
+                                    const size_t head = html.find("<head>");
+                                    if (head != std::string::npos)
+                                    {
+                                        html.insert(head + 6, injection);
+                                    }
+                                    const std::wstring wideHtml = Utf8ToWide(html);
+                                    const HRESULT hr = webview->NavigateToString(wideHtml.c_str());
+                                    g_report.hresultNavigateToString = hr;
+                                    if (FAILED(hr))
+                                    {
+                                        g_report.error =
+                                            "NavigateToString failed, hr=" + std::to_string(hr);
+                                        g_navigationDone = true;
+                                    }
+                                }
+                                else
+                                {
+                                    const HRESULT hr = webview->Navigate(pageUrl.c_str());
+                                    g_report.hresultNavigate = hr;
+                                    if (FAILED(hr))
+                                    {
+                                        g_report.error =
+                                            "Navigate failed, hr=" + std::to_string(hr);
+                                        g_navigationDone = true;
+                                    }
+                                }
                                 return S_OK;
                             })
                             .Get());
@@ -623,7 +884,22 @@ int wmain(int argc, wchar_t **argv)
     }
     if (!g_navigationDone)
     {
-        g_report.error = "timeout waiting for first NavigationCompleted";
+        // 区分"卡在 controller"与"卡在导航"。只说 "timeout waiting for
+        // NavigationCompleted" 会把排查方向引偏——Navigate 可能压根没被调用过。
+        if (g_report.msControllerCreated <= 0.0)
+        {
+            g_report.error =
+                "timeout before controller creation completed (stage: environment created at " +
+                std::to_string(static_cast<long long>(g_report.msEnvironmentCreated)) + " ms)";
+        }
+        else
+        {
+            g_report.error =
+                "timeout waiting for first NavigationCompleted (controller created at " +
+                std::to_string(static_cast<long long>(g_report.msControllerCreated)) +
+                " ms, NavigationStarting seen=" +
+                (g_report.navStartingSeen ? "true" : "false") + ")";
+        }
     }
 
     // 稳定后采样一次，让 Chromium 的子进程都起来。
@@ -654,6 +930,22 @@ int wmain(int argc, wchar_t **argv)
         "  \"error\": \"" + JsonEscape(g_report.error) + "\",\n"
         "  \"hresult\": " + std::to_string(g_report.hresult) + ",\n"
         "  \"navigation_failed\": " + (g_report.navigationFailed ? "true" : "false") + ",\n"
+        "  \"nav_mode\": \"" + JsonEscape(g_report.navMode) + "\",\n"
+        "  \"resolved_page_url\": \"" + JsonEscape(g_report.resolvedPageUrl) + "\",\n"
+        "  \"nav_starting_url\": \"" + JsonEscape(g_report.navStartingUrl) + "\",\n"
+        "  \"nav_starting_seen\": " + (g_report.navStartingSeen ? "true" : "false") + ",\n"
+        "  \"source_changed_url\": \"" + JsonEscape(g_report.sourceChangedUrl) + "\",\n"
+        "  \"source_changed_seen\": " + (g_report.sourceChangedSeen ? "true" : "false") + ",\n"
+        "  \"document_title\": \"" + JsonEscape(g_report.documentTitle) + "\",\n"
+        "  \"nav_error_status\": " + std::to_string(g_report.navErrorStatus) + ",\n"
+        "  \"process_failed_kind\": \"" + JsonEscape(g_report.processFailedKind) + "\",\n"
+        "  \"process_failed_reason\": \"" + JsonEscape(g_report.processFailedReason) + "\",\n"
+        "  \"process_failed_exit_code\": " + std::to_string(g_report.processFailedExitCode) + ",\n"
+        "  \"process_failed_description\": \"" + JsonEscape(g_report.processFailedDescription) + "\",\n"
+        "  \"hresult_get_webview\": " + std::to_string(g_report.hresultGetWebView) + ",\n"
+        "  \"webview_is_null\": " + (g_report.webviewIsNull ? "true" : "false") + ",\n"
+        "  \"hresult_navigate\": " + std::to_string(g_report.hresultNavigate) + ",\n"
+        "  \"hresult_navigate_to_string\": " + std::to_string(g_report.hresultNavigateToString) + ",\n"
         "  \"job_requested\": " + (g_report.jobRequested ? "true" : "false") + ",\n"
         "  \"job_created\": " + (g_report.jobCreated ? "true" : "false") + ",\n"
         "  \"job_assigned_processes\": " + std::to_string(g_report.jobAssigned) + ",\n"

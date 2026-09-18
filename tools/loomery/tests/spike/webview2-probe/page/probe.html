@@ -32,7 +32,9 @@
 
 <script>
 (function () {
-  var params = new URLSearchParams(location.search);
+  // NavigateToString 诊断分支下没有真实 query，由宿主注入 window.__probeQuery。
+  var queryStr = (typeof window.__probeQuery === "string") ? window.__probeQuery : location.search;
+  var params = new URLSearchParams(queryStr);
   var blocks = parseInt(params.get("blocks") || "2000", 10);
   var diagrams = parseInt(params.get("diagrams") || "0", 10);
 

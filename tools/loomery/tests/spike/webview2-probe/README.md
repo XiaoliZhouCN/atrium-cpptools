@@ -52,9 +52,33 @@ powershell -ExecutionPolicy Bypass -File .\run-probe.ps1
 | `-NoShow` | 不显示窗口（**会低估内存**，仅供快速试跑） |
 | `-SkipJobObjectScenarios` | 跳过 Job Object 对照场景 |
 | `-KillAfterReadyMs N` | 外部强杀场景里，观察到 Chromium 子进程后再等多久开杀 |
+| `-ProbeTimeoutMs N` | 单场景等待导航完成的超时（默认 30000） |
+| `-UseNavigateToString` | 改用 `NavigateToString` 注入页面，**绕开 `file://` URI 解析**。纯诊断开关 |
 
 > 跑之前请**关掉自己的 Edge 窗口**能减少干扰，但不是必须——探针用 PID 差分识别"自己制造的"
 > Chromium 进程，不会把你自己已运行的算进去。
+>
+> **每个场景使用独立的 profile 目录**（只有 `clean-cold` / `clean-warm` 这一对故意共用，
+> 因为要测冷热对比）。共用 profile 会让上一场景仍在运行的 Chromium 子进程占住目录，
+> 表现为随机的 controller 创建失败与卡死——这个坑已经踩过一次。
+
+---
+
+## 如果结果仍然是 INCONCLUSIVE
+
+脚本会把无效场景**排除**在孤儿判定之外，并逐条打印诊断。对照下表读：
+
+| 诊断 | 含义 | 下一步 |
+| :-- | :-- | :-- |
+| `timeout before controller creation completed (stage: environment created at N ms)` | environment 建成了，但 controller 一直没回来 | 最常见的失败。先确认没有任何 Edge/WebView2 实例在跑；再看 `process_failed_kind` |
+| `timeout waiting for first NavigationCompleted (... NavigationStarting seen=...)` | controller 建成了。看 `seen=` | `false` = **导航根本没发起**（`Navigate` 的 HRESULT 会一并打印）；`true` = 发起了但浏览器没回 |
+| `CreateCoreWebView2Controller failed` + `hresult` | controller 创建被拒 | `0x80070005` = 拒绝访问；`0x80004004` = `E_ABORT` |
+| `Navigate failed, hr=...` | URI 被拒 | 检查 `resolved_page_url` 是否是合法的 `file:///` |
+| `procFailed: kind=N` | 渲染进程崩溃/被杀 | kind：`0`=浏览器进程, `1`=渲染进程, `2`=GPU, `3`=Utility, `5`=未知；详情看 `process_failed_description` |
+| `get_CoreWebView2 hr != 0` | 拿不到 webview 对象 | 基本等同于 controller 无效 |
+
+**兜底**：如果 `file://` 这条路径始终不通，加 `-UseNavigateToString` 重跑一次。
+它能区分"WebView2 装坏了"和"只是 `file://` URI 处理有问题"——前者怎么都不行，后者换这条路径就能出数。
 
 ---
 
