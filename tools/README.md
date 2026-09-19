@@ -4,7 +4,10 @@
 
 | 工具 | 目录 | 分支 | 状态 |
 | :-- | :-- | :-- | :-- |
-| Loomery | `tools/loomery/` | `tool/loomery` | 骨架（空窗口） |
+| Loomery | `tools/loomery/` | `tool/loomery` | **未开工**（目录与代码都在 `tool/loomery` 分支上） |
+
+> **本目录在框架分支（`develop` / `dev/basic`）上只放容器**：本文件 + `CMakeLists.txt`。
+> 具体工具的代码一律在各自的 `tool/<name>` 分支上，不要出现在框架分支里。
 
 ## 新增工具
 
