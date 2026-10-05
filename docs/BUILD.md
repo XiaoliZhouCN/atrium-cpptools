@@ -1,14 +1,14 @@
 # 构建说明
 
-> 本文档描述 `AtriumCppTools` 的构建方式。规范依据见仓库根 `README.md` §8。
-> 状态：骨架阶段（尚无工具）。最后更新：2026-09-18。
+> 本文档描述 `AtriumCppTools` 的构建方式。规范依据见仓库根 `README.md` §7 与 `BUILD_AND_TEST.md`。
+> 状态：骨架阶段（尚无工具）。最后更新：2026-09-19。
 
 ## 前置条件
 
 | 项 | 要求 | 说明 |
 | :-- | :-- | :-- |
 | CMake | ≥ 3.25 | 预设文件版本为 6 |
-| 编译器 | MSVC x64 | 语言标准 C++20（`README.md` §7.3） |
+| 编译器 | MSVC x64 | 语言标准 C++20（`NAMING_AND_INTERFACES.md` §6） |
 | Visual Studio | 2022 或 2026，含 "使用 C++ 的桌面开发" 工作负载 | `build.bat` 通过 `vswhere` 自动探测，无写死路径 |
 | Ninja | 可选 | 仅 `windows-ninja-*` 预设需要；见下方"已知问题" |
 
@@ -43,7 +43,7 @@ build.bat windows-ninja-debug test
 
 每个 configure 预设都有配对的 `build-<preset>` 与 `test-<preset>` 预设（覆盖 Ninja 与 VS 生成器、Debug 与 Release），因此 `build.bat <preset> test` 对**全部**预设都成立。VS 生成器是多配置的，其 test 预设显式带 `configuration: Debug`。
 
-预设是**唯一**构建描述来源：不在 IDE 内另存配置，不提交 `.vcxproj` / `.sln`（`README.md` §8.1）。
+预设是**唯一**构建描述来源：不在 IDE 内另存配置，不提交 `.vcxproj` / `.sln`（`BUILD_AND_TEST.md` §1）。
 本机特有的路径覆盖请写入 `CMakeUserPresets.json`（已被 `.gitignore` 忽略）。
 
 ## 产物位置
@@ -53,13 +53,13 @@ build/<preset>/bin/          # 可执行文件
 build/<preset>/lib/          # 静态库
 ```
 
-`build/` 整体被忽略，禁止提交任何构建产物（`README.md` §8.4、目录红线 D6）。
+`build/` 整体被忽略，禁止提交任何构建产物（`BUILD_AND_TEST.md` §4、目录红线 D6）。
 
 ## 常用选项
 
 | 选项 | 默认 | 说明 |
 | :-- | :-- | :-- |
-| `ATRIUM_BUILD_TESTS` | `ON` | 是否构建单元 / 契约测试（`README.md` §9.1） |
+| `ATRIUM_BUILD_TESTS` | `ON` | 是否构建单元 / 契约测试（`BUILD_AND_TEST.md` §5） |
 
 ```bat
 cmake --preset windows-vs2026-debug -DATRIUM_BUILD_TESTS=OFF
@@ -153,7 +153,7 @@ ctest --preset test-windows-vs2026-debug
 
 ## 验证要求
 
-任何改动提交前必须完成（`README.md` §9.2、`AGENTS.md`）：
+任何改动提交前必须完成（`BUILD_AND_TEST.md` §6、`AGENTS.md`）：
 
 1. 干净构建通过（非增量）。
 2. 契约测试通过。
